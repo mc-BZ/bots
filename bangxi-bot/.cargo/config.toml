@@ -1,0 +1,18 @@
+[net]
+git-fetch-with-cli = true
+retry = 5
+
+[http]
+multiplexing = false
+
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+
+[source.rsproxy-sparse]
+registry = "file:///home/baosh/.cargo-local-index"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
