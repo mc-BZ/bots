@@ -1,186 +1,401 @@
 use azalea::prelude::*;
-use azalea::core::position::Vec3;
-use axum::{extract::State, routing::post, Json, Router};
+use azalea::WalkDirection;
+use azalea::protocol::packets::game::s_interact::InteractionHand;
+use azalea::protocol::packets::game::s_swing::ServerboundSwing;
+use axum::{extract::Query, extract::State, routing::get, routing::post, Json, Router};
 use parking_lot::Mutex;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-/// 共享状态，用于 HTTP 服务器和 Bot 之间通信
+/// 单个 bot 的运行时上下文（HTTP 层与游戏层共享）
 #[derive(Clone, Component)]
-struct SharedState {
-    /// 待发送的聊天消息队列
-    pending_chat: Arc<Mutex<Vec<String>>>,
-    /// 标记是否已完成自动登录
-    login_done: Arc<Mutex<bool>>,
+struct BotContext {
+    player: String,
+    password: String,
+    /// 待发送的聊天消息队列（HTTP → bot）
+    queue: Arc<Mutex<Vec<String>>>,
+    /// 登出标记（HTTP → bot）
+    logout: Arc<AtomicBool>,
 }
 
-impl Default for SharedState {
-    fn default() -> Self {
+impl BotContext {
+    fn new(player: String, password: String) -> Self {
         Self {
-            pending_chat: Arc::new(Mutex::new(Vec::new())),
-            login_done: Arc::new(Mutex::new(false)),
+            player,
+            password,
+            queue: Arc::new(Mutex::new(Vec::new())),
+            logout: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-/// HTTP 请求体
-#[derive(Deserialize)]
-struct ChatRequest {
-    message: String,
+impl Default for BotContext {
+    fn default() -> Self {
+        Self::new(String::new(), String::new())
+    }
+}
+
+/// 所有 bot 的注册表（HTTP 层）
+#[derive(Clone, Default)]
+struct BotRegistry {
+    bots: Arc<Mutex<HashMap<String, BotContext>>>,
 }
 
 /// HTTP 应用状态
 #[derive(Clone)]
 struct AppState {
-    shared: SharedState,
+    reg: BotRegistry,
+    /// 创建 bot 的通道（HTTP → LocalSet）
+    bot_tx: tokio::sync::mpsc::UnboundedSender<(String, BotContext)>,
+}
+
+/// HTTP 查询/请求结构
+#[derive(Deserialize)]
+struct LoginQuery {
+    player: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct ChatQuery {
+    player: String,
+}
+
+#[derive(Deserialize)]
+struct ChatBody {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct LogoutQuery {
+    player: String,
 }
 
 #[tokio::main]
 async fn main() -> AppExit {
-    // 创建共享状态
-    let shared = SharedState::default();
+    let registry = BotRegistry::default();
+    let (bot_tx, mut bot_rx) = tokio::sync::mpsc::unbounded_channel::<(String, BotContext)>();
     let app_state = AppState {
-        shared: shared.clone(),
+        reg: registry.clone(),
+        bot_tx,
     };
 
-    // 启动 HTTP 服务器（在后台 task 中）
+    // HTTP 管理服务器（axum 内部用 tokio::spawn，跑在全局 runtime）
     tokio::spawn(async move {
         let app = Router::new()
+            .route("/login", get(handle_login).post(handle_login))
             .route("/chat", post(handle_chat))
+            .route("/logout", get(handle_logout).post(handle_logout))
             .with_state(app_state);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:7777").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:7777")
+            .await
+            .unwrap();
         println!("[HTTP] Server listening on http://127.0.0.1:7777");
         axum::serve(listener, app).await.unwrap();
     });
 
-    // 启动 Minecraft Bot
-    let account = Account::offline("bzbot");
-    // 如果要使用正版账号，取消下面一行的注释：
-    // let account = Account::microsoft("your_email@example.com").await.unwrap();
-
-    println!("[Bot] Connecting to server...");
-
-    ClientBuilder::new()
-        .set_handler(handle)
-        .set_state(shared)
-        .start(account, "bx.bangxi.top")
-        .await
+    // LocalSet：启动 bot task（azalea 的 ClientBuilder::start() 是 !Send future，
+    // 必须跑在 LocalSet 里）。通过 channel 接收 /login 的创建请求。
+    let local = tokio::task::LocalSet::new();
+    local.spawn_local(async move {
+        let reg2 = registry.clone();
+        while let Some((player, ctx)) = bot_rx.recv().await {
+            let reg3 = reg2.clone();
+            tokio::task::spawn_local(async move {
+                start_bot(player.clone(), ctx).await;
+                // bot 结束后从注册表移除，之后可重新 /login
+                reg3.bots.lock().remove(&player);
+                println!("[HTTP] Bot removed from registry: {}", player);
+            });
+        }
+    });
+    local.await;
+    AppExit::Success
 }
 
-/// HTTP POST /chat 处理器
-async fn handle_chat(
-    State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
-) -> &'static str {
-    println!("[HTTP] Received chat request: {}", req.message);
-    state.shared.pending_chat.lock().push(req.message);
+/// POST /login?player=xxx&password=yyy —— 创建并登录名为 xxx 的 bot
+async fn handle_login(State(app): State<AppState>, Query(q): Query<LoginQuery>) -> &'static str {
+    let player = q.player.clone();
+    let password = q.password.clone();
+    let ctx = BotContext::new(player.clone(), password);
+    {
+        let mut bots = app.reg.bots.lock();
+        if bots.contains_key(&player) {
+            return "already online";
+        }
+        bots.insert(player.clone(), ctx.clone());
+    }
+    println!("[HTTP] Login request: player={}", player);
+    // 通知 LocalSet 启动该 bot
+    let _ = app.bot_tx.send((player, ctx));
     "ok"
 }
 
+/// POST /chat?player=xxx  body {"message":"..."} —— 让名为 xxx 的 bot 在游戏里发言
+async fn handle_chat(
+    State(app): State<AppState>,
+    Query(q): Query<ChatQuery>,
+    Json(body): Json<ChatBody>,
+) -> &'static str {
+    let bots = app.reg.bots.lock();
+    match bots.get(&q.player) {
+        Some(ctx) => {
+            ctx.queue.lock().push(body.message);
+            "ok"
+        }
+        None => "bot not online",
+    }
+}
+
+/// POST /logout?player=xxx —— 让名为 xxx 的 bot 断开登出
+async fn handle_logout(
+    State(app): State<AppState>,
+    Query(q): Query<LogoutQuery>,
+) -> &'static str {
+    let bots = app.reg.bots.lock();
+    match bots.get(&q.player) {
+        Some(ctx) => {
+            ctx.logout.store(true, Ordering::Relaxed);
+            "ok"
+        }
+        None => "bot not online",
+    }
+}
+
+/// 启动一个 bot 客户端并保持在线
+async fn start_bot(player: String, ctx: BotContext) {
+    println!("[Bot:{}] Connecting to server...", player);
+    let account = Account::offline(&player);
+    let _exit = ClientBuilder::new()
+        .set_handler(handle_event)
+        .set_state(ctx)
+        // 禁用自动重连：断开后 start() 返回，task 结束并从注册表移除，
+        // 避免传送失败等情况下无限重连循环
+        .reconnect_after(None)
+        .start(account, "bx.bangxi.top")
+        .await;
+    println!("[Bot:{}] Bot task ended", player);
+}
+
 /// Bot 事件处理器
-async fn handle(bot: Client, event: Event, state: SharedState) -> eyre::Result<()> {
+async fn handle_event(bot: Client, event: Event, ctx: BotContext) -> eyre::Result<()> {
     match event {
         Event::Spawn => {
-            // 只在首次生成时执行登录流程
-            {
-                let mut login_done = state.login_done.lock();
-                if *login_done {
-                    return Ok(());
-                }
-                *login_done = true;
-            }
-
-            println!("[Bot] Spawned! Starting auto-login sequence...");
-
-            // 等待服务器稳定
+            println!("[Bot:{}] Spawned! Starting auto-login sequence...", ctx.player);
             bot.wait_ticks(40).await;
 
-            // ========== 步骤 1: 输入 /login xxx ==========
-            println!("[Bot] Step 1: Sending /login command");
-            bot.chat("/login Bbsw2013");
+            // ========== 步骤 1: /login ==========
+            println!("[Bot:{}] Step 1: /login", ctx.player);
+            bot.chat(format!("/login {}", ctx.password));
+            bot.wait_ticks(80).await; // 等待服务器处理登录命令
 
-            // 等待服务器处理登录命令（放宽到 4 秒）
-            bot.wait_ticks(80).await;
+            // ========== 步骤 2: 前进 2 格并面向正前方（水平），右键手里的钟表 ==========
+            // 菜单插件依赖完整的右键动作触发，且单次右键有时不被服务器接受（时好时坏）。
+            // 先补发 ServerboundSwing（挥臂），等 100ms 再 start_use_item，
+            // 并检测菜单是否真的打开（玩家物品栏 46 格 = 没打开），没开就重试。
+            println!("[Bot:{}] Step 2: Walking forward 2 blocks, then right-clicking clock", ctx.player);
+            let start = bot.position()?;
+            bot.walk(WalkDirection::Forward);
+            let mut walked = false;
+            for _ in 0..120 {
+                // 最多 6 秒，水平位移达到 2 格就停
+                bot.wait_ticks(1).await;
+                let p = bot.position()?;
+                let dx = p.x - start.x;
+                let dz = p.z - start.z;
+                if dx * dx + dz * dz >= 4.0 {
+                    walked = true;
+                    break;
+                }
+            }
+            bot.walk(WalkDirection::None);
+            if !walked {
+                println!("[Bot:{}] Warn: didn't walk 2 blocks (stuck?), proceeding anyway", ctx.player);
+            }
+            bot.wait_ticks(5).await; // 停稳
 
-            // ========== 步骤 2: 抬头看天空（确保准星 Miss），右键手里的钟表 ==========
-            // start_use_item 的行为取决于准星：指向方块/实体会变成对方块/实体右键，
-            // 菜单不会打开。先看向天空，保证发送的是「使用物品」。
-            println!("[Bot] Step 2: Looking up, then right-clicking clock in hand");
-            let pos = bot.position()?;
-            bot.look_at(Vec3::new(pos.x, pos.y + 100.0, pos.z));
-            bot.wait_ticks(10).await; // 0.5 秒等视角生效
-            bot.start_use_item();
+            // 菜单是否已打开：玩家自己的物品栏固定 46 格，打开容器后格数不同
+            let menu_open = |bot: &Client| -> bool {
+                match bot.get_inventory() {
+                    Ok(c) => match c.contents() {
+                        Some(contents) => contents.len() != 46,
+                        None => false,
+                    },
+                    Err(_) => false,
+                }
+            };
 
-            // ========== 步骤 3: 轮询容器，等菜单内容加载后点击信标 ==========
-            // 菜单内容不会立刻同步，逐秒重试，最多 8 次（8 秒）
-            let mut clicked = false;
+            let mut menu_opened = false;
+            for attempt in 0..4 {
+                // 面向正前方：保持当前 yaw，pitch 置 0（水平）
+                let yaw = {
+                    let d = bot.direction()?;
+                    d.y_rot()
+                };
+                bot.set_direction(yaw, 0.0)?;
+                bot.wait_ticks(10).await; // 0.5 秒等视角生效
+                // 完整右键：先挥臂（swing），等 100ms 让 swing 先到服务器，再使用物品
+                bot.write_packet(ServerboundSwing {
+                    hand: InteractionHand::MainHand,
+                });
+                bot.wait_ticks(2).await;
+                bot.start_use_item();
+                // 等最多 3 秒确认菜单打开
+                for _ in 0..3 {
+                    bot.wait_ticks(20).await; // 1 秒
+                    if menu_open(&bot) {
+                        menu_opened = true;
+                        break;
+                    }
+                }
+                if menu_opened {
+                    println!("[Bot:{}] Menu opened after right-click (attempt {})", ctx.player, attempt);
+                    break;
+                }
+                println!(
+                    "[Bot:{}] Menu not opened yet, retry right-click (attempt {})",
+                    ctx.player,
+                    attempt + 1
+                );
+            }
+            if !menu_opened {
+                // 4 次完整右键都没打开菜单，断开本 bot（不杀进程，不影响其他 bot）
+                println!("[Bot:{}] FATAL: menu did not open, disconnecting", ctx.player);
+                bot.disconnect();
+                return Ok(());
+            }
+
+            // ========== 步骤 3: 轮询容器，等菜单内容加载，找到信标槽位 ==========
+            let mut beacon_slot: Option<usize> = None;
             for attempt in 0..8 {
                 bot.wait_ticks(20).await; // 1 秒
                 match bot.get_inventory() {
                     Ok(container) => {
                         if let Some(title) = container.title() {
-                            println!("[Bot] Container opened: {}", title.to_string());
+                            println!("[Bot:{}] Container opened: {}", ctx.player, title.to_string());
                         }
                         if let Some(contents) = container.contents() {
                             println!(
-                                "[Bot] Container has {} slots (attempt {})",
+                                "[Bot:{}] Container has {} slots (attempt {})",
+                                ctx.player,
                                 contents.len(),
                                 attempt
                             );
-                            let mut found_beacon = false;
                             for (index, slot) in contents.iter().enumerate() {
                                 if let azalea::inventory::ItemStack::Present(item) = slot {
-                                    println!("[Bot] Slot {}: {:?}", index, item.kind);
+                                    println!("[Bot:{}] Slot {}: {:?}", ctx.player, index, item.kind);
                                     if item.kind == azalea::registry::builtin::ItemKind::Beacon {
-                                        println!("[Bot] Found beacon at slot {}, clicking...", index);
-                                        container.left_click(index);
-                                        clicked = true;
-                                        found_beacon = true;
+                                        beacon_slot = Some(index);
                                         break;
                                     }
                                 }
                             }
-                            if found_beacon {
+                            if beacon_slot.is_some() {
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        println!("[Bot] Failed to get inventory: {:?}", e);
+                        println!("[Bot:{}] Failed to get inventory: {:?}", ctx.player, e);
                     }
                 }
             }
 
-            // 兜底：8 秒内始终没找到信标，点容器中央（保持原行为）
-            if !clicked {
-                if let Ok(container) = bot.get_inventory() {
-                    if let Some(contents) = container.contents() {
-                        let center_index = match contents.len() {
-                            27 => 13,  // 9x3 箱子菜单正中央
-                            54 => 31,  // 9x6 大箱子正中央
-                            n => n / 2, // 其他大小，取中间
+            match beacon_slot {
+                Some(slot) => {
+                    // ========== 步骤 4: 左键点击信标并验证传送（位置变化） ==========
+                    println!(
+                        "[Bot:{}] Found beacon at slot {}, clicking (left-click)...",
+                        ctx.player, slot
+                    );
+                    let mut teleported = false;
+                    for click_try in 0..6 {
+                        let before = bot.position()?;
+                        if let Ok(container) = bot.get_inventory() {
+                            container.left_click(slot);
+                        }
+                        bot.wait_ticks(40).await; // 2 秒
+                        let p = bot.position()?;
+                        let win = match bot.get_inventory() {
+                            Ok(c) => Some(c.id()),
+                            Err(_) => None,
                         };
                         println!(
-                            "[Bot] Beacon not found by scanning, clicking center slot {}",
-                            center_index
+                            "[Bot:{}] click#{} pos=({:.1},{:.1}) window={:?}",
+                            ctx.player,
+                            click_try + 1,
+                            p.x,
+                            p.z,
+                            win
                         );
-                        if center_index < contents.len() {
-                            container.left_click(center_index);
+                        let dx = p.x - before.x;
+                        let dz = p.z - before.z;
+                        if dx * dx + dz * dz > 0.25 {
+                            // 水平位移超过 0.5 格，认为传送成功
+                            teleported = true;
+                            println!(
+                                "[Bot:{}] Teleported to ({}, {}), after click #{}",
+                                ctx.player,
+                                p.x as i32,
+                                p.z as i32,
+                                click_try + 1
+                            );
+                            break;
+                        }
+                        println!(
+                            "[Bot:{}] Teleport not detected after click #{}, retrying...",
+                            ctx.player,
+                            click_try + 1
+                        );
+                    }
+                    if !teleported {
+                        // 传送没触发（如账号被封禁等），断开本 bot，可重新 /login
+                        println!("[Bot:{}] FATAL: teleport did not trigger, disconnecting", ctx.player);
+                        bot.disconnect();
+                        return Ok(());
+                    }
+                }
+                None => {
+                    // 兜底：8 秒内始终没找到信标，点容器中央（保持原行为）
+                    if let Ok(container) = bot.get_inventory() {
+                        if let Some(contents) = container.contents() {
+                            let center_index = match contents.len() {
+                                27 => 13,  // 9x3 箱子菜单正中央
+                                54 => 31,  // 9x6 大箱子正中央
+                                n => n / 2, // 其他大小，取中间
+                            };
+                            println!(
+                                "[Bot:{}] Beacon not found by scanning, clicking center slot {}",
+                                ctx.player, center_index
+                            );
+                            if center_index < contents.len() {
+                                container.left_click(center_index);
+                            }
                         }
                     }
                 }
             }
 
-            println!("[Bot] Auto-login sequence completed!");
+            println!("[Bot:{}] Auto-login sequence completed!", ctx.player);
         }
 
         Event::Tick => {
-            // 检查是否有待发送的 HTTP 消息
-            let messages: Vec<String> = std::mem::take(&mut *state.pending_chat.lock());
-            for msg in messages {
-                println!("[Bot] Sending chat from HTTP: {}", msg);
+            // 登出标记
+            if ctx.logout.load(Ordering::Relaxed) {
+                println!("[Bot:{}] Logout requested, disconnecting", ctx.player);
+                bot.disconnect();
+                return Ok(());
+            }
+            // 消费消息队列（限速 3 秒/条、每轮最多 5 条，防止高频调用导致游戏内刷屏封号）
+            let messages: Vec<String> = std::mem::take(&mut *ctx.queue.lock());
+            for msg in messages.into_iter().take(5) {
+                println!("[Bot:{}] Sending chat: {}", ctx.player, msg);
                 bot.chat(msg);
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
 
@@ -189,16 +404,20 @@ async fn handle(bot: Client, event: Event, state: SharedState) -> eyre::Result<(
             let (sender, content) = m.split_sender_and_content();
             if let Some(sender) = sender {
                 if sender != bot.username() {
-                    println!("[Chat] {}: {}", sender, content);
+                    println!("[Chat:{}] {}: {}", ctx.player, sender, content);
                 }
             }
         }
 
         Event::Disconnect(reason) => {
             println!(
-                "[Bot] Disconnected: {:?}",
+                "[Bot:{}] Disconnected: {:?}",
+                ctx.player,
                 reason.as_ref().map(|r| r.to_string())
             );
+            // 已禁用自动重连，断开即结束：退出 client，让 start() 返回，
+            // 从而移除注册表（之后可重新 /login）
+            bot.exit();
         }
 
         _ => {}
