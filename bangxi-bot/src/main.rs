@@ -19,6 +19,10 @@ struct BotContext {
     queue: Arc<Mutex<Vec<String>>>,
     /// 登出标记（HTTP → bot）
     logout: Arc<AtomicBool>,
+    /// 收到游戏内聊天时转发到的 webhook（None = 不转发；/set_chathook 设置）
+    chathook: Arc<Mutex<Option<String>>>,
+    /// 已发送认证命令（/login 或 /reg），防止重复发送（spawn 兜底与 Chat 事件共用）
+    authenticated: Arc<AtomicBool>,
 }
 
 impl BotContext {
@@ -28,6 +32,8 @@ impl BotContext {
             password,
             queue: Arc::new(Mutex::new(Vec::new())),
             logout: Arc::new(AtomicBool::new(false)),
+            chathook: Arc::new(Mutex::new(None)),
+            authenticated: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -74,6 +80,19 @@ struct LogoutQuery {
     player: String,
 }
 
+/// /set_chathook 的 query 参数（也可放 JSON body，见 SetChatHookBody）
+#[derive(Deserialize)]
+struct SetChatHookQuery {
+    player: Option<String>,
+    hookurl: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetChatHookBody {
+    player: Option<String>,
+    hookurl: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> AppExit {
     let registry = BotRegistry::default();
@@ -89,6 +108,7 @@ async fn main() -> AppExit {
             .route("/login", get(handle_login).post(handle_login))
             .route("/chat", post(handle_chat))
             .route("/logout", get(handle_logout).post(handle_logout))
+            .route("/set_chathook", post(handle_set_chathook))
             .with_state(app_state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:7777")
@@ -166,6 +186,60 @@ async fn handle_logout(
     }
 }
 
+/// POST /set_chathook —— 设置名为 player 的 bot 收到游戏内聊天时转发到的 webhook。
+/// 参数 player / hookurl 支持 query 或 JSON body 两种传法：
+///   curl -X POST "http://127.0.0.1:7777/set_chathook?player=xxx&hookurl=http://..."
+///   curl -X POST http://127.0.0.1:7777/set_chathook -d '{"player":"xxx","hookurl":"http://..."}'
+/// hookurl 留空 = 清除转发。bot 收到聊天后会向 hookurl POST form 表单 message=<聊天内容>。
+async fn handle_set_chathook(
+    State(app): State<AppState>,
+    Query(q): Query<SetChatHookQuery>,
+    body: Option<Json<SetChatHookBody>>,
+) -> &'static str {
+    let player = q.player.or_else(|| body.as_ref().and_then(|b| b.player.clone()));
+    let hookurl = q
+        .hookurl
+        .or_else(|| body.as_ref().and_then(|b| b.hookurl.clone()));
+    let (Some(player), Some(hookurl)) = (player, hookurl) else {
+        return "bad request";
+    };
+    let bots = app.reg.bots.lock();
+    match bots.get(&player) {
+        Some(ctx) => {
+            let hook = if hookurl.trim().is_empty() {
+                None
+            } else {
+                Some(hookurl)
+            };
+            *ctx.chathook.lock() = hook;
+            println!("[HTTP] Set chathook: player={}", player);
+            "ok"
+        }
+        None => "bot not online",
+    }
+}
+
+/// 从服务器消息中提取 /captcha 命令（含参数），找不到返回 None。
+/// 例："请使用 /captcha 4f7a 完成验证" -> "/captcha 4f7a"
+/// 例："发送 /captcha1234 完成验证"  -> "/captcha1234"
+/// 提取规则：找到 /captcha 后连续收集 ASCII 字母数字/空白/斜杠，遇到中文等非 ASCII 即停。
+fn extract_captcha_command(msg: &str) -> Option<String> {
+    let lower = msg.to_lowercase();
+    let idx = lower.find("/captcha")?;
+    let cmd: String = msg[idx..]
+        .chars()
+        .take_while(|c| {
+            c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || *c == '/'
+        })
+        .collect();
+    let cmd = cmd.trim().to_string();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
 /// 启动一个 bot 客户端并保持在线
 async fn start_bot(player: String, ctx: BotContext) {
     println!("[Bot:{}] Connecting to server...", player);
@@ -188,9 +262,24 @@ async fn handle_event(bot: Client, event: Event, ctx: BotContext) -> eyre::Resul
             println!("[Bot:{}] Spawned! Starting auto-login sequence...", ctx.player);
             bot.wait_ticks(40).await;
 
-            // ========== 步骤 1: /login ==========
-            println!("[Bot:{}] Step 1: /login", ctx.player);
-            bot.chat(format!("/login {}", ctx.password));
+            // ========== 步骤 1: 等待服务器认证提示，提示已到则跳过 ==========
+            // 服务器 spawn 后通常会发 /captcha、/reg 或 /login 提示，Chat 事件检测到后
+            // 已直接发送对应命令（并置位 authenticated）。这里等 3 秒（60 ticks）：
+            // 提示已到则什么都不发（发过 /reg 就不再发 /login），没有提示则兜底发 /login
+            // （兼容不发提示的服务器）。
+            println!("[Bot:{}] Step 1: waiting for auth hint (up to 3s)...", ctx.player);
+            bot.wait_ticks(60).await;
+            if !ctx.authenticated.load(Ordering::Relaxed) {
+                let cmd = format!("/login {}", ctx.password);
+                ctx.authenticated.store(true, Ordering::Relaxed);
+                println!("[Bot:{}] Step 1: no auth hint, fallback: {}", ctx.player, cmd);
+                bot.chat(cmd);
+            } else {
+                println!(
+                    "[Bot:{}] Step 1: auth command already sent via chat event",
+                    ctx.player
+                );
+            }
             bot.wait_ticks(80).await; // 等待服务器处理登录命令
 
             // ========== 步骤 2: 前进 2 格并面向正前方（水平），右键手里的钟表 ==========
@@ -402,9 +491,55 @@ async fn handle_event(bot: Client, event: Event, ctx: BotContext) -> eyre::Resul
         Event::Chat(m) => {
             // 打印收到的聊天消息（调试用）
             let (sender, content) = m.split_sender_and_content();
+            // 服务器提示 /reg（如"请先使用 /reg 注册"）：若还没认证，发 /reg <pw> <pw>。
+            // 注册成功后插件一般自动登录，因此发过 /reg 就不再发 /login（authenticated 置位）。
+            if content.contains("/reg") && !ctx.authenticated.load(Ordering::Relaxed) {
+                let cmd = format!("/reg {} {}", ctx.password, ctx.password);
+                ctx.authenticated.store(true, Ordering::Relaxed);
+                println!("[Bot:{}] Server requested /reg, sending: {}", ctx.player, cmd);
+                bot.chat(cmd);
+            }
+            // 服务器提示 /login（如"请输入密码以登录"）：若还没认证，发 /login <pw>
+            if content.contains("/login") && !ctx.authenticated.load(Ordering::Relaxed) {
+                let cmd = format!("/login {}", ctx.password);
+                ctx.authenticated.store(true, Ordering::Relaxed);
+                println!("[Bot:{}] Server requested /login, sending: {}", ctx.player, cmd);
+                bot.chat(cmd);
+            }
+            // 服务器要求 /captcha 验证：从消息里提取完整命令（含验证码）并立即发送
+            if let Some(cmd) = extract_captcha_command(&content) {
+                println!("[Bot:{}] Server requested captcha, sending: {}", ctx.player, cmd);
+                bot.chat(cmd);
+            }
             if let Some(sender) = sender {
                 if sender != bot.username() {
                     println!("[Chat:{}] {}: {}", ctx.player, sender, content);
+                    // 设置了 chathook 时，把收到的聊天 POST 到 hook（异步，不阻塞 bot 事件循环）
+                    let hook = ctx.chathook.lock().clone();
+                    if let Some(hook) = hook {
+                        let player = ctx.player.clone();
+                        tokio::spawn(async move {
+                            let res = reqwest::Client::new()
+                                .post(&hook)
+                                .form(&[("message", content)])
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) => println!(
+                                    "[ChatHook:{}] POST {} -> {}",
+                                    player,
+                                    hook,
+                                    r.status()
+                                ),
+                                Err(e) => println!(
+                                    "[ChatHook:{}] POST {} failed: {}",
+                                    player,
+                                    hook,
+                                    e
+                                ),
+                            }
+                        });
+                    }
                 }
             }
         }
